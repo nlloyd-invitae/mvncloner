@@ -11,7 +11,6 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.time.Duration;
@@ -52,22 +51,17 @@ public class Publisher {
     public void publish() throws Exception {
         LOG.info("Publishing to " + rootUrl + " ...");
         ThreadPoolExecutor requestThreadPool = (ThreadPoolExecutor)Executors.newFixedThreadPool(this.publisherThreads);
-        HttpClient httpClient = HttpClient.newBuilder()
-                .executor(requestThreadPool)
-                .version(HttpClient.Version.HTTP_1_1)
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
-        publishDirectory(httpClient, rootUrl, Paths.get(rootMirrorPath).normalize());
-        LOG.info("Publishing complete.");
+        publishDirectory(requestThreadPool, rootUrl, Paths.get(rootMirrorPath).normalize());
         try {
+            requestThreadPool.shutdown();
             requestThreadPool.awaitTermination(600L, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             LOG.error(e.getMessage());
         }
-        requestThreadPool.shutdown();
+        LOG.info("Publishing complete.");
     }
 
-    public void publishDirectory(HttpClient httpClient, String repositoryUrl, Path mirrorPath)
+    public void publishDirectory(ThreadPoolExecutor threadPoolExecutor, String repositoryUrl, Path mirrorPath)
         throws IOException, InterruptedException {
 
         LOG.debug("Switching to mirror directory: " + mirrorPath.toAbsolutePath());
@@ -79,7 +73,9 @@ public class Publisher {
                 if (Files.isDirectory(path)) {
                     recursePaths.add(path);
                 } else {
-                    handleFile(httpClient, repositoryUrl, path);
+                    threadPoolExecutor.execute(
+                            new RunnableUploader(repositoryUrl, this.username, this.password, path)
+                    );
                 }
             }
         }
@@ -87,29 +83,8 @@ public class Publisher {
         // Tail recursion
         for (Path recursePath : recursePaths) {
             String subpath = mirrorPath.relativize(recursePath).toString();
-            publishDirectory(httpClient, appendUrlPathSegment(repositoryUrl, subpath), recursePath);
+            publishDirectory(threadPoolExecutor, appendUrlPathSegment(repositoryUrl, subpath), recursePath);
         }
-    }
-
-    private void handleFile(HttpClient httpClient, String repositoryUrl, Path path)
-        throws IOException, InterruptedException {
-
-        String filename = path.getFileName().toString();
-        String targetUrl = repositoryUrl + filename;
-        LOG.info("Uploading " + targetUrl);
-
-//        Utils.sleep(Long.parseLong(this.sleepTimeInMS));
-//        byte[] payload = Files.readAllBytes(path);
-        HttpRequest request = Utils.setCredentials(HttpRequest.newBuilder(), username, password)
-            .uri(URI.create(targetUrl))
-            .timeout(Duration.ofMinutes(10))    // for big files... just in case
-            .header("X-Checksum-Sha1", Utils.computeFileSHA1(path.toFile()))
-            .PUT(BodyPublishers.ofFile(path))
-            .build();
-        httpClient.sendAsync(request, BodyHandlers.ofString())
-            .thenApply(HttpResponse::statusCode)
-            .thenAccept(Publisher::getStatusMessage)
-            .join();
     }
 
     private String appendUrlPathSegment(String baseUrl, String segment) {
@@ -124,13 +99,49 @@ public class Publisher {
         return result.toString();
     }
 
-    private static void getStatusMessage(int statusCode) {
-        if (statusCode >= 200 && statusCode <= 299) {
-            LOG.info("Uploaded Successfully!");
-        } else if (statusCode == 403) {
-            LOG.info("Already uploaded");
-        } else {
-            LOG.error("Something bad happened during upload: " + statusCode);
+    private class RunnableUploader implements Runnable {
+        private String repositoryUrl = null;
+        private String username = null;
+        private String password = null;
+        private Path targetFile = null;
+
+        public RunnableUploader(String repositoryUrl, String username, String password, Path targetFile) {
+            this.repositoryUrl = repositoryUrl;
+            this.username = username;
+            this.password = password;
+            this.targetFile = targetFile;
+        }
+
+        public void run() {
+            try {
+                String filename = this.targetFile.getFileName().toString();
+                String targetUrl = this.repositoryUrl + filename;
+                LOG.info("Uploading " + targetUrl);
+                HttpClient httpClient = HttpClient.newBuilder()
+                        .version(HttpClient.Version.HTTP_1_1)
+                        .followRedirects(HttpClient.Redirect.NORMAL)
+                        .build();
+                HttpRequest request = Utils.setCredentials(HttpRequest.newBuilder(), this.username, this.password)
+                        .uri(URI.create(targetUrl))
+                        .timeout(Duration.ofMinutes(10))    // for big files... just in case
+                        .header("X-Checksum-Sha1", Utils.computeFileSHA1(this.targetFile.toFile()))
+                        .PUT(BodyPublishers.ofFile(this.targetFile))
+                        .build();
+                HttpResponse<String> response = httpClient.send(request, BodyHandlers.ofString());
+                int statusCode = response.statusCode();
+                if (statusCode >= 200 && statusCode <= 299) {
+                    LOG.info("Uploaded Successfully!");
+                } else if (statusCode == 403) {
+                    LOG.info("Already uploaded");
+                } else {
+                    LOG.error("Something bad happened during upload: " + statusCode);
+                    LOG.error("Error message body: " + response.body());
+                }
+                LOG.debug("statusCode: " + statusCode);
+                LOG.debug("message body: " + response.body());
+            } catch (IOException | InterruptedException exception) {
+                LOG.error(exception.getMessage());
+            }
         }
     }
 }

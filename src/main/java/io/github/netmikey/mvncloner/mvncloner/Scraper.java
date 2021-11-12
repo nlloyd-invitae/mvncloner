@@ -113,9 +113,10 @@ public class Scraper {
         Page rawPage = webClient.getPage(pageUrl);
         HtmlPage page = null;
         if (!HtmlPage.class.isInstance(rawPage)) {
-            LOG.error("unexpected response from urlL: " + pageUrl.toString());
-            Files.copy(rawPage.getWebResponse().getContentAsStream(), Paths.get("./mirror/wtfisthis"));
-            throw new RuntimeException("got an unexpected Page type: " + page.toString());
+            LOG.warn("unexpected response from url: " + pageUrl.toString());
+            LOG.warn(rawPage.getClass().toString());
+            LOG.warn("Skipping url: " + pageUrl.toString());
+            return;
         } else {
             page = (HtmlPage)rawPage;
         }
